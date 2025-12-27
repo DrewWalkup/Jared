@@ -12,6 +12,7 @@ import JaredFramework
 struct Webhook: Decodable {
     var url: String
     var routes: [Route]?
+    var secret: String?  // HMAC shared secret for request signing
 }
 
 struct WebhookResponse: Decodable {
