@@ -1,23 +1,28 @@
-# HMAC Webhook Authentication
+# HMAC Authentication
 
-This document explains how HMAC request signing works in Jared for securing webhook communications.
+This document explains HMAC request signing in Jared for securing both webhook and REST API communications.
 
 ## Overview
 
-When Jared sends webhook requests to your server, it can optionally sign each request using HMAC-SHA256. This allows your server to verify that requests genuinely came from Jared, preventing spoofed requests from attackers.
+Jared supports HMAC-SHA256 request signing in two directions:
+
+| Direction                          | Use Case                     | Configuration       |
+| ---------------------------------- | ---------------------------- | ------------------- |
+| **Outbound** (Jared → Your Server) | Webhook notifications        | `webhooks[].secret` |
+| **Inbound** (Your Server → Jared)  | REST API `/message` endpoint | `webServer.secret`  |
+
+Both use the same signature format for consistency.
 
 ## How It Works
 
 ```
-┌─────────┐                              ┌─────────────┐
-│  Jared  │  ──── POST /webhook ────►    │ Your Server │
-│  (Mac)  │  + X-Timestamp               │  (Django)   │
-│         │  + X-Nonce                   │             │
-│         │  + X-Signature               │             │
-└─────────┘                              └─────────────┘
+┌─────────────┐                                    ┌─────────────┐
+│ Your Server │  ◄──── Webhooks (signed) ────      │    Jared    │
+│  (Django)   │  ──── /message (signed) ────►      │    (Mac)    │
+└─────────────┘                                    └─────────────┘
 ```
 
-When a webhook has a `secret` configured, Jared adds three HTTP headers to every request:
+When a `secret` is configured, requests include three HTTP headers:
 
 | Header        | Description                           | Example                                |
 | ------------- | ------------------------------------- | -------------------------------------- |
@@ -27,36 +32,42 @@ When a webhook has a `secret` configured, Jared adds three HTTP headers to every
 
 ### Signature Computation
 
-The signature is computed by concatenating the timestamp, nonce, and request body **with NUL byte delimiters**, then applying HMAC-SHA256:
-
 ```
 signature = HMAC-SHA256(secret, timestamp + \0 + nonce + \0 + request_body)
 ```
 
 > **Why NUL delimiters?** Without delimiters, different (timestamp, nonce, body) combinations could produce identical concatenated strings, creating a security vulnerability.
 
-## Configuration
+---
 
-Add a `secret` to any webhook in your `config.json`:
+## Configuration
 
 ```json
 {
 	"webhooks": [
 		{
-			"url": "https://your-server.com/api/webhook/",
-			"secret": "your-shared-secret-here"
+			"url": "https://your-server.com/webhook/",
+			"secret": "webhook-secret-here"
 		}
-	]
+	],
+	"webServer": {
+		"port": 3001,
+		"secret": "rest-api-secret-here"
+	}
 }
 ```
 
-> **Note:** Keep this secret secure! It should match a secret stored on your receiving server.
+> **Note:** Secrets are optional. Without a secret, requests are unsigned/unverified.
 
-## Code Walkthrough
+---
+
+## Outbound: Webhook Signing (Jared → Your Server)
+
+When webhooks have a `secret`, Jared signs outbound requests so your server can verify authenticity.
 
 ### Jared Side (Swift)
 
-The signing happens in [`WebHookManager.swift`](Jared/WebHookManager.swift):
+The signing happens in [`WebHookManager.swift`](../Jared/WebHookManager.swift):
 
 ```swift
 import CryptoKit
@@ -65,29 +76,25 @@ private func addSignatureHeaders(to request: inout URLRequest, body: Data, secre
     let timestamp = String(Int(Date().timeIntervalSince1970))
     let nonce = UUID().uuidString
 
-    // Build payload with NUL delimiters (prevents ambiguous concatenation)
+    // Build payload with NUL delimiters
     var payload = Data()
     payload.append(contentsOf: timestamp.utf8)
-    payload.append(0) // NUL delimiter
+    payload.append(0)
     payload.append(contentsOf: nonce.utf8)
-    payload.append(0) // NUL delimiter
-    payload.append(body)  // Raw bytes, no string conversion
+    payload.append(0)
+    payload.append(body)
 
-    // Compute HMAC-SHA256
     let secretKey = SymmetricKey(data: Data(secret.utf8))
     let mac = HMAC<SHA256>.authenticationCode(for: payload, using: secretKey)
     let signatureHex = mac.map { String(format: "%02x", $0) }.joined()
 
-    // Use setValue (not addValue) to avoid duplicate headers
     request.setValue(timestamp, forHTTPHeaderField: "X-Timestamp")
     request.setValue(nonce, forHTTPHeaderField: "X-Nonce")
     request.setValue(signatureHex, forHTTPHeaderField: "X-Signature")
 }
 ```
 
-### Server Side (Python/Django)
-
-Your server should verify signatures like this:
+### Verifying in Django/Python
 
 ```python
 import hmac
@@ -96,17 +103,6 @@ import time
 from django.core.cache import cache
 
 def verify_jared_signature(request, secret: str, max_age_seconds: int = 60) -> bool:
-    """
-    Verify that a webhook request came from Jared.
-
-    Args:
-        request: The Django request object
-        secret: The shared secret (must match Jared's config)
-        max_age_seconds: Maximum age of request (prevents replay attacks)
-
-    Returns:
-        True if signature is valid, False otherwise
-    """
     timestamp = request.headers.get("X-Timestamp")
     nonce = request.headers.get("X-Nonce")
     signature = request.headers.get("X-Signature")
@@ -114,75 +110,110 @@ def verify_jared_signature(request, secret: str, max_age_seconds: int = 60) -> b
     if not timestamp or not nonce or not signature:
         return False
 
-    # 1) Timestamp freshness
+    # Timestamp freshness
     try:
         request_time = int(timestamp)
     except ValueError:
         return False
 
     now = int(time.time())
-    if request_time > now + max_age_seconds:
-        return False  # too far in the future
-    if now - request_time > max_age_seconds:
-        return False  # too old
+    if abs(now - request_time) > max_age_seconds:
+        return False
 
-    # 2) Nonce replay protection
-    nonce_key = f"jared_nonce:{nonce}"
-    if not cache.add(nonce_key, 1, timeout=max_age_seconds):
-        return False  # nonce already used
+    # Nonce replay protection
+    if not cache.add(f"jared_nonce:{nonce}", 1, timeout=max_age_seconds):
+        return False
 
-    # 3) Compute expected signature with NUL delimiters (raw bytes)
-    body = request.body  # bytes exactly as received
-    payload = timestamp.encode("utf-8") + b"\0" + nonce.encode("utf-8") + b"\0" + body
-
-    expected = hmac.new(
-        secret.encode("utf-8"),
-        payload,
-        hashlib.sha256
-    ).hexdigest()
+    # Verify signature
+    body = request.body
+    payload = timestamp.encode() + b"\0" + nonce.encode() + b"\0" + body
+    expected = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
 
     return hmac.compare_digest(signature, expected)
 ```
 
-Usage in a Django view:
+---
+
+## Inbound: REST API Verification (Your Server → Jared)
+
+When `webServer.secret` is configured, Jared verifies signatures on `/message` requests.
+
+### Jared Side (Swift)
+
+Verification happens in [`JaredWebServer.swift`](../Jared/JaredWebServer.swift):
+
+```swift
+private func verifySignature(request: HTTPRequest, secret: String, maxAgeSeconds: Int = 60) -> Bool {
+    guard let timestamp = request.headers["X-Timestamp"],
+          let nonce = request.headers["X-Nonce"],
+          let signature = request.headers["X-Signature"] else {
+        return false
+    }
+
+    // Check timestamp freshness
+    guard let requestTime = Int(timestamp) else { return false }
+    let now = Int(Date().timeIntervalSince1970)
+    if abs(now - requestTime) > maxAgeSeconds { return false }
+
+    // Build expected signature
+    var payload = Data()
+    payload.append(contentsOf: timestamp.utf8)
+    payload.append(0)
+    payload.append(contentsOf: nonce.utf8)
+    payload.append(0)
+    payload.append(request.body)
+
+    let secretKey = SymmetricKey(data: Data(secret.utf8))
+    let mac = HMAC<SHA256>.authenticationCode(for: payload, using: secretKey)
+    let expected = mac.map { String(format: "%02x", $0) }.joined()
+
+    // Timing-safe comparison
+    return signature == expected  // (actual impl uses XOR comparison)
+}
+```
+
+### Signing in Django/Python
 
 ```python
-from django.http import JsonResponse
+import hmac
+import hashlib
+import time
+import uuid
+import json
+import requests
 
-JARED_WEBHOOK_SECRET = "your-shared-secret-here"  # Store in settings/env
+def send_message_to_jared(jared_url: str, secret: str, body: dict):
+    body_bytes = json.dumps(body).encode('utf-8')
+    timestamp = str(int(time.time()))
+    nonce = str(uuid.uuid4())
 
-def webhook_endpoint(request):
-    if not verify_jared_signature(request, JARED_WEBHOOK_SECRET):
-        return JsonResponse({"error": "Invalid signature"}, status=401)
+    payload = timestamp.encode() + b'\0' + nonce.encode() + b'\0' + body_bytes
+    signature = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
 
-    # Process the verified webhook...
-    data = json.loads(request.body)
-    # ...
+    headers = {
+        'Content-Type': 'application/json',
+        'X-Timestamp': timestamp,
+        'X-Nonce': nonce,
+        'X-Signature': signature
+    }
+
+    return requests.post(f"{jared_url}/message", data=body_bytes, headers=headers)
 ```
+
+---
 
 ## Security Best Practices
 
-1. **Keep secrets secure** - Never commit secrets to git. Use environment variables or a secrets manager.
+1. **Keep secrets secure** — Use environment variables, not hardcoded strings
+2. **Use HTTPS** — Encrypt traffic to prevent MITM attacks
+3. **Track nonces** — Store used nonces in Redis/Memcached (shared across workers)
+4. **60-second window** — Requests outside this window are rejected
 
-2. **Reject old requests** - The timestamp check (default: 60 seconds) prevents attackers from replaying captured requests.
+## Files
 
-3. **Track nonces** - The nonce cache prevents replay attacks within the time window.
-
-4. **Use HTTPS** - Always use HTTPS for webhooks to prevent man-in-the-middle attacks.
-
-## Backward Compatibility
-
-The `secret` field is **optional**. Webhooks without a secret will work exactly as before—no HMAC headers will be added. This allows gradual migration.
-
-## Files Changed
-
-| File                                                                   | Purpose                                  |
-| ---------------------------------------------------------------------- | ---------------------------------------- |
-| [`Webhook.swift`](Jared/Webhook.swift)                                 | Added `secret: String?` field to model   |
-| [`WebHookManager.swift`](Jared/WebHookManager.swift)                   | Added HMAC signing logic using CryptoKit |
-| [`Documentation/webhooks.md`](Documentation/webhooks.md)               | Added HMAC section to docs               |
-| [`Documentation/config-sample.json`](Documentation/config-sample.json) | Added secret field examples              |
-
-## Questions?
-
-See the full [webhook documentation](Documentation/webhooks.md) for more details on the webhook API.
+| File                                                    | Purpose                  |
+| ------------------------------------------------------- | ------------------------ |
+| [`Webhook.swift`](../Jared/Webhook.swift)               | Webhook `secret` field   |
+| [`WebHookManager.swift`](../Jared/WebHookManager.swift) | Outbound signing         |
+| [`Configuration.swift`](../Jared/Configuration.swift)   | WebServer `secret` field |
+| [`JaredWebServer.swift`](../Jared/JaredWebServer.swift) | Inbound verification     |

@@ -25,6 +25,7 @@
 		}
 	],
 	"webServer": {
-		"port": 3001
+		"port": 3001,
+		"secret": "your-rest-api-secret-here"
 	}
 }

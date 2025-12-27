@@ -22,6 +22,12 @@ struct ConfigurationFile: Decodable {
 
 struct WebserverConfiguration: Decodable {
     let port: Int
+    let secret: String?  // HMAC shared secret for request verification
+    
+    init(port: Int, secret: String? = nil) {
+        self.port = port
+        self.secret = secret
+    }
 }
 
 struct RouteConfiguration: Decodable {
