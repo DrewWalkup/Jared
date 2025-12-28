@@ -90,7 +90,7 @@ class ViewController: NSViewController, DiskAccessDelegate {
                 self.RestApiStatusImage.image = NSImage(named: NSImage.statusAvailableName)
             }
             
-            switch(CNAuthorizationStatus(rawValue: self.defaults.integer(forKey: JaredConstants.contactsAccess))) {
+            switch(PermissionsHelper.getContactsStatus()) {
             case .notDetermined:
                 self.contactsLabel.stringValue = "Contacts access not set"
                 self.contactsButton.title = "Enable Contacts"
